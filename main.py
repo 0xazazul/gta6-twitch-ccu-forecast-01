@@ -19,18 +19,29 @@ release day):
    markets, a small one means the unlock is still coming. So the shape is
    predicted from the hour-1 level.
 2. Median: a local-linear (kernel-weighted least squares) fit of r_h on
-   ln(hour-1 print), Gaussian kernel with bandwidth 2.0 in log units, fitted
-   separately for each hour. Local, not global: the log-ratio/log-level
-   relation bends sharply at the top end, and a single global line badly
-   mispredicts the biggest launches (checked on past launches: training only
-   on launches with hour-1 <= 500k and predicting the three above it, the
-   global line scores ~0.40 pinball loss while this local fit scores ~0.17).
-3. Spread: honest leave-one-out residuals of the same local fit. For each
-   comparable launch, refit without it and record the residual at its own
-   hour-1 level; the spread for the target hour is the standard deviation of
-   the residuals of the 12 comparables nearest in log hour-1 level to the
-   target, scaled by 0.9 (leave-one-out residuals slightly overstate the
-   error of a fit that uses all launches). Quantiles are
+   ln(hour-1 print), Gaussian kernel with bandwidth 2.5 in log units, fitted
+   separately for each hour -- but ONLY on the launches the case itself tiers
+   as clean comparables. Each comparable's `unlock` note carries the house's
+   own tier ("Tier: comparable" / "Tier: early-access-contaminated" /
+   "Tier: weak"). Early-access launches have an inflated hour 1 (players in
+   days early), which flattens their curves and drags the fit down exactly
+   where a clean launch like GTA VI (console-only, rolling midnight, no early
+   access) grows; dropping them removes a systematic under-prediction of
+   hours 5-24 of about +0.2 to +0.5 in log units on the practice cases.
+   Launches with no tier label at all default to comparable.
+3. Extrapolation guard: GTA VI's hour 1 will likely sit above every training
+   launch, and a local-linear slope extrapolated past the data range overshoots
+   (the log-ratio/log-level relation flattens at the top: the biggest launches
+   all have near-flat shapes). Past the largest training level, the median is
+   pulled halfway back to its value at that level (slope damped by 0.5).
+4. Spread: honest leave-one-out residuals of the same filtered local fit,
+   evaluated at EVERY usable launch (the full pool, early-access and weak
+   launches included: their wild shapes are real uncertainty about launch
+   shapes). For each hour, the spread is the standard deviation of the
+   residuals of the 12 launches nearest in log hour-1 level to the target,
+   with the smallest and largest residual trimmed first (a couple of launches
+   have extreme shapes that would otherwise blow the spread up), smoothed
+   across hours and scaled by 0.9. Quantiles are
    q_tau = p1 * exp(median_h + z_tau * sigma_h) with z the standard normal
    quantiles, rounded half-up to 2 decimals.
 
@@ -43,9 +54,13 @@ Local measurement (pinball loss on the log scale, lower is better; the
 practice answers are the four past launches' release-day counts, verified
 against each case's known hour-1 print):
 
-  practice cases p00-p03: 0.178 (house baseline 0.387 on the same cases)
-  leave-one-out over the 16 comparables with hour-1 >= 100k: 0.211
-  top-edge check (train on hour-1 <= 500k, test the three above): 0.173
+  practice cases p00-p03: 0.134 (was 0.178 for the submitted version:
+  per-case 0.099 / 0.134 / 0.111 / 0.193; house baseline 0.387)
+  leave-one-out over the 10 clean comparables with hour-1 >= 100k: 0.186
+  (submitted version 0.195)
+  top-edge check (train on hour-1 <= 500k, test the two clean launches
+  above it): 0.109 (submitted version 0.150)
+  90% coverage on practice: 0.913
 
 How the grader runs it: `python3 -P -s /bot/main.py` in python:3.13-slim,
 standard library only, no network. Outside the grader's container,
@@ -57,6 +72,7 @@ MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -74,8 +90,8 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
 
 # Gaussian kernel bandwidth, in natural-log units of the hour-1 print.
-BANDWIDTH = 2.0
-# How many of the nearest (in log hour-1 level) comparables' leave-one-out
+BANDWIDTH = 2.5
+# How many of the nearest (in log hour-1 level) launches' leave-one-out
 # residuals set an hour's spread.
 NEAREST_K = 12
 # Leave-one-out residuals slightly overstate the error of the full fit.
@@ -85,6 +101,13 @@ SIGMA_FLOOR = 0.05
 # The house baseline's spread, used only when a case carries no usable
 # comparable launch at all.
 FALLBACK_SIGMA = 0.15
+# Past the largest training level, the local-linear slope is damped by this
+# factor: the log-ratio/log-level relation flattens at the top.
+SLOPE_DAMP = 0.5
+# The median fit uses only clean comparables unless too few are present.
+MIN_CLEAN_ROWS = 8
+
+_TIER_RE = re.compile(r"Tier:\s*([a-z\-]+)")
 
 
 def parse_time(text):
@@ -113,13 +136,30 @@ def hour_of(day_start, stamp):
     return hour if 1 <= hour <= 24 else None
 
 
+def tier_of(comp):
+    """The house's own tier for a comparable, read from its `unlock` note.
+
+    "Tier: early-access-contaminated" launches had players in days early, so
+    their hour 1 is inflated and their curves are flattened; "Tier: weak"
+    launches are poor analogues. Anything else -- including a note with no
+    tier label at all -- counts as a clean comparable.
+    """
+    match = _TIER_RE.search(comp.get("unlock") or "")
+    label = match.group(1) if match else ""
+    if label == "early-access-contaminated":
+        return "early-access"
+    if label == "weak":
+        return "weak"
+    return "comparable"
+
+
 def training_rows(case):
     """One row per comparable launch with a complete release day.
 
-    Each row is (log hour-1 print, {hour: log-ratio to hour 1}). A launch is
-    usable only when every hour 1..24 has a positive viewer count; the GTA VI
-    category's own pre-release history has no release day yet, so it drops
-    out here on its own.
+    Each row is (log hour-1 print, {hour: log-ratio to hour 1}, tier). A
+    launch is usable only when every hour 1..24 has a positive viewer count;
+    the GTA VI category's own pre-release history has no release day yet, so
+    it drops out here on its own.
     """
     rows = []
     for comp in case.get("comparables", []):
@@ -141,7 +181,8 @@ def training_rows(case):
         if len(hours) < 24 or 1 not in hours:
             continue
         p1 = hours[1]
-        rows.append((math.log(p1), {h: math.log(hours[h] / p1) for h in range(2, 25)}))
+        rows.append((math.log(p1), {h: math.log(hours[h] / p1) for h in range(2, 25)},
+                     tier_of(comp)))
     return rows
 
 
@@ -149,18 +190,18 @@ def local_linear(rows, target_logp1, hour):
     """Kernel-weighted least squares of log-ratio on log hour-1 print.
 
     Returns (intercept, slope) of the local line at the target's level, fitted
-    on `rows` (each (logp1, {hour: log-ratio})). A flat fit when the local
-    spread of levels is too small to support a slope.
+    on `rows` (each (logp1, {hour: log-ratio}, tier)). A flat fit when the
+    local spread of levels is too small to support a slope.
     """
-    weights = [math.exp(-((lp - target_logp1) / BANDWIDTH) ** 2) for lp, _ in rows]
+    weights = [math.exp(-((lp - target_logp1) / BANDWIDTH) ** 2) for lp, _, _ in rows]
     total = sum(weights)
     if total <= 0:
         return 0.0, 0.0
-    mean_x = sum(w * lp for w, (lp, _) in zip(weights, rows)) / total
-    mean_y = sum(w * r[hour] for w, (_, r) in zip(weights, rows)) / total
-    sxx = sum(w * (lp - mean_x) ** 2 for w, (lp, _) in zip(weights, rows))
+    mean_x = sum(w * lp for w, (lp, _, _) in zip(weights, rows)) / total
+    mean_y = sum(w * r[hour] for w, (_, r, _) in zip(weights, rows)) / total
+    sxx = sum(w * (lp - mean_x) ** 2 for w, (lp, _, _) in zip(weights, rows))
     sxy = sum(w * (lp - mean_x) * (r[hour] - mean_y)
-              for w, (lp, r) in zip(weights, rows))
+              for w, (lp, r, _) in zip(weights, rows))
     slope = sxy / sxx if sxx > 1e-9 else 0.0
     return mean_y - slope * mean_x, slope
 
@@ -172,6 +213,53 @@ def pstdev(values):
         return 0.0
     mean = sum(values) / n
     return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
+
+
+def trimmed_pstdev(values):
+    """Population SD after trimming the smallest and largest value.
+
+    A couple of launches have extreme shapes (hour-1 near zero before a
+    simultaneous global unlock); trimming keeps one such launch from setting
+    the whole spread.
+    """
+    ordered = sorted(values)
+    if len(ordered) > 4:
+        ordered = ordered[1:-1]
+    return pstdev(ordered)
+
+
+def smooth(values):
+    """Light 3-point smoothing of a per-hour dict across hours (w = 0.25)."""
+    out = {}
+    for h in range(2, 25):
+        a = values.get(h - 1, values[h])
+        b = values[h]
+        c = values.get(h + 1, values[h])
+        out[h] = 0.5 * b + 0.25 * (a + c)
+    return out
+
+
+def median_log_ratio(rows, target_logp1):
+    """The median log-ratio per hour from the clean-pool local fit.
+
+    `rows` is the full usable pool; the fit itself uses only the clean
+    comparables (all rows if too few are clean). Past the largest clean
+    training level the slope is damped: the shape/log-level relation flattens
+    at the top, and an undamped extrapolation overshoots.
+    """
+    clean = [row for row in rows if row[2] == "comparable"]
+    fit_rows = clean if len(clean) >= MIN_CLEAN_ROWS else rows
+    median = {}
+    for h in range(2, 25):
+        intercept, slope = local_linear(fit_rows, target_logp1, h)
+        median[h] = intercept + slope * target_logp1
+    top = max(lp for lp, _, _ in fit_rows)
+    if target_logp1 > top:
+        for h in range(2, 25):
+            intercept, slope = local_linear(fit_rows, top, h)
+            at_top = intercept + slope * top
+            median[h] = at_top + SLOPE_DAMP * (median[h] - at_top)
+    return median
 
 
 def forecast_case(case, name):
@@ -193,17 +281,21 @@ def forecast_case(case, name):
             hours.append({"hour": h, "q": [round2(p1 * math.exp(z * FALLBACK_SIGMA * math.sqrt(h - 1))) for z in Z]})
         return {"hours": hours}
 
-    # Median log-ratio per hour from the local fit at the target's level.
-    median = {}
-    for h in range(2, 25):
-        intercept, slope = local_linear(rows, logp1, h)
-        median[h] = intercept + slope * logp1
+    # Median log-ratio per hour from the clean-pool local fit.
+    median = median_log_ratio(rows, logp1)
 
-    # Honest spread: leave-one-out residuals of the same local fit, one per
-    # comparable launch, then the spread of the nearest launches' residuals.
+    # Honest spread: leave-one-out residuals of the same clean-pool local
+    # fit, evaluated at every usable launch (the full pool: early-access and
+    # weak launches are real uncertainty about launch shapes), then the
+    # trimmed spread of the nearest launches' residuals.
+    clean = [row for row in rows if row[2] == "comparable"]
+    fit_rows = clean if len(clean) >= MIN_CLEAN_ROWS else rows
     loo_residuals = {h: [] for h in range(2, 25)}
-    for i, (lp_i, r_i) in enumerate(rows):
-        rest = rows[:i] + rows[i + 1:]
+    for i, (lp_i, r_i, _) in enumerate(rows):
+        # Leave-one-out over the fit pool: drop the row itself when it is in
+        # the pool (identity match: fit_rows holds the same objects as rows).
+        # A launch outside the fit pool leaves the fit unchanged.
+        rest = [row for row in fit_rows if row is not rows[i]]
         for h in range(2, 25):
             intercept, slope = local_linear(rest, lp_i, h)
             loo_residuals[h].append(r_i[h] - (intercept + slope * lp_i))
@@ -211,7 +303,9 @@ def forecast_case(case, name):
     sigma = {}
     for h in range(2, 25):
         nearby = [loo_residuals[h][i] for i in nearest]
-        sigma[h] = max(SIGMA_FLOOR, pstdev(nearby) * SIGMA_SCALE)
+        sigma[h] = trimmed_pstdev(nearby)
+    sigma = smooth(sigma)
+    sigma = {h: max(SIGMA_FLOOR, s * SIGMA_SCALE) for h, s in sigma.items()}
 
     for row in case["forecast"]:
         h = row["hour"]
